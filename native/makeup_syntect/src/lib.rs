@@ -1,5 +1,4 @@
 use rustler::{Env, NifMap, NifResult, NifTuple, Resource, ResourceArc};
-use std::sync::Mutex;
 use syntect::easy::ScopeRegionIterator;
 use syntect::parsing::{ParseState, ScopeStack, ScopeStackOp, SyntaxReference};
 
@@ -23,7 +22,11 @@ struct SyntaxInfo {
 }
 
 #[derive(Debug)]
-struct SyntaxSetResource(Mutex<syntect::parsing::SyntaxSet>);
+// The syntax set is shared, not cloned, between calls. syntect compiles each
+// regex lazily into a OnceCell, and cloning a SyntaxSet drops every compiled
+// regex, so a clone per call would recompile them all behind onig's global
+// mutex on every tokenize.
+struct SyntaxSetResource(syntect::parsing::SyntaxSet);
 
 #[rustler::resource_impl(register = true)]
 impl Resource for SyntaxSetResource {}
@@ -240,7 +243,7 @@ fn map_scope_to_token_type(
     get_atom(token_type)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn initialize_syntaxes_from_folders(
     folders: Vec<String>,
 ) -> NifResult<ResourceArc<SyntaxSetResource>> {
@@ -252,20 +255,23 @@ fn initialize_syntaxes_from_folders(
     }
 
     let syntax_set = builder.build();
-    Ok(ResourceArc::new(SyntaxSetResource(Mutex::new(syntax_set))))
+    Ok(ResourceArc::new(SyntaxSetResource(syntax_set)))
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn do_tokenize(
     env: Env,
     text: String,
     language_opt: Option<String>,
     syntax_set_resource: Option<ResourceArc<SyntaxSetResource>>,
 ) -> NifResult<Vec<Token>> {
-    let syntax_set = if let Some(resource) = syntax_set_resource {
-        resource.0.lock().unwrap().clone()
-    } else {
-        two_face::syntax::extra_newlines()
+    let fallback;
+    let syntax_set: &syntect::parsing::SyntaxSet = match &syntax_set_resource {
+        Some(resource) => &resource.0,
+        None => {
+            fallback = two_face::syntax::extra_newlines();
+            &fallback
+        }
     };
 
     let syntax = match language_opt {
@@ -287,7 +293,7 @@ fn do_tokenize(
     let lines: Vec<&str> = text.split_inclusive('\n').collect();
 
     for line in lines {
-        let ops: Vec<(usize, ScopeStackOp)> = parse_state.parse_line(&line, &syntax_set).unwrap();
+        let ops: Vec<(usize, ScopeStackOp)> = parse_state.parse_line(line, syntax_set).unwrap();
 
         for (token_str, op) in ScopeRegionIterator::new(&ops, line) {
             stack
@@ -318,12 +324,15 @@ fn do_tokenize(
     Ok(tokens)
 }
 
-#[rustler::nif]
+#[rustler::nif(schedule = "DirtyCpu")]
 fn get_supported_syntaxes(syntax_set_resource: Option<ResourceArc<SyntaxSetResource>>) -> NifResult<Vec<SyntaxInfo>> {
-    let syntax_set = if let Some(resource) = syntax_set_resource {
-        resource.0.lock().unwrap().clone()
-    } else {
-        two_face::syntax::extra_newlines()
+    let fallback;
+    let syntax_set: &syntect::parsing::SyntaxSet = match &syntax_set_resource {
+        Some(resource) => &resource.0,
+        None => {
+            fallback = two_face::syntax::extra_newlines();
+            &fallback
+        }
     };
 
     let syntaxes: Vec<SyntaxInfo> = syntax_set
